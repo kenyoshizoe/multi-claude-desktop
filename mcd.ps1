@@ -21,7 +21,8 @@
 param(
     [Parameter(Position = 0)]
     [ValidateSet('list', 'add', 'remove', 'launch', 'stamp', 'sync-config',
-                 'share', 'unshare', 'tray', 'autostart', 'icon', 'open', 'where', 'help')]
+                 'share', 'unshare', 'sync-sessions', 'tray', 'autostart', 'icon',
+                 'open', 'where', 'help')]
     [string]$Command = 'help',
 
     [Parameter(Position = 1)]
@@ -359,6 +360,27 @@ function Find-Profile {
     $Config.profiles | Where-Object { $_.name -eq $ProfileName } | Select-Object -First 1
 }
 
+function Test-DesktopExePath {
+    # Is this claude.exe the desktop app, rather than the Claude Code CLI?
+    #
+    # Both are called claude.exe, and an instance on the stock profile carries
+    # no --user-data-dir to tell them apart - so a CLI session would otherwise
+    # be reported as the default profile running, and block share/unshare.
+    # Match on where the app is installed instead of listing places the CLI
+    # has lived: the CLI moves (it is at ~\.local\bin now), the install
+    # locations are the ones Resolve-ClaudeExe already knows.
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    if ($Path -match '\\WindowsApps\\Claude_[^\\]+\\app\\claude\.exe$') { return $true }
+    foreach ($known in @(
+        (Join-Path $env:LOCALAPPDATA 'AnthropicClaude\claude.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Programs\Claude\Claude.exe'),
+        'C:\Program Files\Claude\Claude.exe')) {
+        if ($Path -ieq $known) { return $true }
+    }
+    return $false
+}
+
 function Get-RunningProfiles {
     # Match live claude.exe processes back to a data dir via their command line.
     $result = @{}
@@ -368,9 +390,7 @@ function Get-RunningProfiles {
         if (-not $cl) { continue }
         # Only the main process (no --type=renderer etc.) identifies the profile.
         if ($cl -match '--type=') { continue }
-        # The bundled Claude Code CLI is also called claude.exe; it is not an
-        # app instance and must not be attributed to the default profile.
-        if ($p.ExecutablePath -and $p.ExecutablePath -match '\\claude-code[\\-]') { continue }
+        if (-not (Test-DesktopExePath -Path $p.ExecutablePath)) { continue }
         if ($cl -match '--user-data-dir=("([^"]+)"|(\S+))') {
             $dir = $matches[2]
             if (-not $dir) { $dir = $matches[3] }
@@ -1076,12 +1096,6 @@ shell.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -File" & args, 0, F
 #
 # Sharing is opt-in per profile via "shareSessions" in profiles.json.
 
-function Get-SharedSessionsDir {
-    param($Config)
-    if ($Config.sharedSessionsDir) { return [string]$Config.sharedSessionsDir }
-    return (Join-Path $env:APPDATA 'Claude-shared\claude-code-sessions')
-}
-
 function Set-ProfileProp {
     # profiles.json round-trips through ConvertFrom-Json, so entries are
     # PSCustomObjects: new fields have to be added, not just assigned.
@@ -1161,124 +1175,157 @@ function Remove-JunctionPath {
     [System.IO.Directory]::Delete($Path, $false)
 }
 
-function Copy-SessionIndex {
-    # The directory is flat: local_<uuid>.json plus archived-sessions.idx,
-    # deleted_<uuid> markers and scheduled-tasks.json. The uuid names never
-    # collide across profiles; for the handful of fixed names the destination
-    # wins, so seeding the shared store never clobbers what is already there.
-    param([string]$From, [string]$To, [switch]$Overwrite)
+function Get-SessionIndexDir {
+    # A profile's real index directory, or $null. A junction here is a
+    # leftover from the old sharing scheme and is never synced into - see
+    # New-SessionIndexSync.
+    param($Prof, [switch]$Quiet)
+    $ids = Resolve-SessionIdentity -Prof $Prof -Quiet:$Quiet
+    if (-not $ids) { return $null }
+    if (-not (Test-Path -LiteralPath $ids.path)) { return $null }
+    if (Test-JunctionPath -Path $ids.path) { return $null }
+    return $ids.path
+}
+
+function Get-IndexBackupDir {
+    # Overwritten entries are parked here, one generation per entry.
+    #
+    # Deliberately outside every Claude data directory: anything left in the
+    # index folder is a file the app will enumerate, and this is ours, not
+    # its. Under LOCALAPPDATA rather than the checkout so it survives moving
+    # or re-cloning the tool.
+    param([string]$ProfileName)
+    $safe = ($ProfileName -replace '[^A-Za-z0-9._-]', '_')
+    return (Join-Path $env:LOCALAPPDATA "multi-claude-desktop\session-index-backup\$safe")
+}
+
+function Save-OverwrittenIndexEntry {
+    # Keep the copy we are about to replace. One generation, same file name,
+    # so this cannot grow without bound.
+    param([string]$Path, [string]$ProfileName)
+    try {
+        $dir = Get-IndexBackupDir -ProfileName $ProfileName
+        if (-not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        Copy-Item -LiteralPath $Path -Destination (Join-Path $dir (Split-Path $Path -Leaf)) -Force -ErrorAction Stop
+        return $true
+    } catch { return $false }
+}
+
+function Get-DeletedSessionIds {
+    # deleted_<id> marker files, whose body is the deletion time in unix ms.
+    # Which id it holds - the session's own uuid or the cli session id - is
+    # not something the app spells out, so callers match against both. Being
+    # wrong in that direction only means declining to copy something in,
+    # which is the harmless outcome.
+    param([string]$Dir)
+    $out = @{}
+    foreach ($f in @(Get-ChildItem -LiteralPath $Dir -Filter 'deleted_*' -File -ErrorAction SilentlyContinue)) {
+        $out[$f.Name.Substring(8)] = $true
+    }
+    return $out
+}
+
+function New-SessionIndexSync {
+    # Keep every opted-in profile's session list the same, by handing the
+    # newest copy of each entry to everyone.
+    #
+    #   - only local_<uuid>.json; the uuid names cannot collide
+    #   - for each entry, the copy with the newest mtime wins and is pushed
+    #     to every profile that has an older one or none at all
+    #   - the write is temp-file-plus-rename, so a running Claude Desktop
+    #     never sees a half-written entry
+    #   - the destination's mtime is set to the source's, so a pass with
+    #     nothing new to do copies nothing and the set converges
+    #   - nothing is ever deleted, and a session the profile holds a
+    #     deleted_ marker for is not handed back to it
+    #   - archived-sessions.idx and scheduled-tasks.json are shared state
+    #     under a fixed name, so they are left alone entirely
+    #
+    # Losing here costs metadata only - title, archived flag, last focused.
+    # The conversation itself lives in the transcript, which this never
+    # touches. The replaced copy is still parked under
+    # %LOCALAPPDATA%\multi-claude-desktop\session-index-backup, one
+    # generation per entry, mostly so a misbehaving pass can be seen and
+    # undone.
+    param($Config, [switch]$Quiet)
+
+    $parts = @()
+    foreach ($p in $Config.profiles) {
+        if (-not (Test-ShareEnabled -Prof $p)) { continue }
+        $dir = Get-SessionIndexDir -Prof $p -Quiet
+        if (-not $dir) { continue }
+        $parts += [pscustomobject]@{
+            Name    = [string]$p.name
+            Dir     = $dir
+            Files   = @{}
+            Deleted = (Get-DeletedSessionIds -Dir $dir)
+        }
+    }
+    if ($parts.Count -lt 2) { return 0 }
+
+    # Directory listings only - a pass with nothing to do opens no files.
+    $best = @{}
+    foreach ($pt in $parts) {
+        foreach ($f in @(Get-ChildItem -LiteralPath $pt.Dir -Filter 'local_*.json' -File -ErrorAction SilentlyContinue)) {
+            $pt.Files[$f.Name] = $f
+            $cur = $best[$f.Name]
+            if (-not $cur -or $f.LastWriteTimeUtc -gt $cur.LastWriteTimeUtc) { $best[$f.Name] = $f }
+        }
+    }
+
     $copied = 0
-    foreach ($f in @(Get-ChildItem -LiteralPath $From -File -ErrorAction SilentlyContinue)) {
-        $dest = Join-Path $To $f.Name
-        if ((Test-Path -LiteralPath $dest) -and -not $Overwrite) { continue }
-        Copy-Item -LiteralPath $f.FullName -Destination $dest -Force
-        $copied++
+    foreach ($pt in $parts) {
+        foreach ($name in $best.Keys) {
+            $src = $best[$name]
+            $have = $pt.Files[$name]
+            if ($have -and $have.LastWriteTimeUtc -ge $src.LastWriteTimeUtc) { continue }
+            if ($src.DirectoryName -ieq $pt.Dir) { continue }
+
+            if (-not $have) {
+                # Only relevant for an entry the profile does not have: a
+                # marker may be filed under the session uuid or the cli id.
+                $uuid = $name.Substring(6, $name.Length - 11)   # local_<uuid>.json
+                if ($pt.Deleted.ContainsKey($uuid)) { continue }
+                if ($pt.Deleted.Count -gt 0) {
+                    $cli = $null
+                    try { $cli = [string](Get-Content -LiteralPath $src.FullName -Raw -Encoding UTF8 | ConvertFrom-Json).cliSessionId } catch { }
+                    if ($cli -and $pt.Deleted.ContainsKey($cli)) { continue }
+                }
+            }
+
+            $dest = Join-Path $pt.Dir $name
+            $tmp = "$dest.mcd-tmp"
+            try {
+                # Park the version we are replacing before it goes.
+                if ($have) { Save-OverwrittenIndexEntry -Path $dest -ProfileName $pt.Name | Out-Null }
+                Copy-Item -LiteralPath $src.FullName -Destination $tmp -Force -ErrorAction Stop
+                # Carry the source's timestamp across, or the copy would look
+                # newer than its origin and bounce back on the next pass.
+                (Get-Item -LiteralPath $tmp).LastWriteTimeUtc = $src.LastWriteTimeUtc
+                Move-Item -LiteralPath $tmp -Destination $dest -Force -ErrorAction Stop
+                $copied++
+                if (-not $Quiet) {
+                    Write-Info "  -> $($pt.Name): $name$(if ($have) { ' (updated)' } else { '' })"
+                }
+            } catch {
+                Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+                if (-not $Quiet) { Write-Warn2 "  !! $($pt.Name): $name - $($_.Exception.Message)" }
+            }
+        }
     }
     return $copied
 }
 
-function Remove-OldBackup {
-    # Toggling sharing off and on again would otherwise leave one snapshot
-    # behind per round trip. Three is plenty of insurance.
-    param([string]$Path, [int]$Keep = 3)
-    $parent = Split-Path -Parent $Path
-    $leaf = Split-Path -Leaf $Path
-    Get-ChildItem -LiteralPath $parent -Directory -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -like "$leaf.mcd-bak-*" } |
-        Sort-Object Name -Descending |
-        Select-Object -Skip $Keep |
-        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force }
-}
-
-function Sync-SessionSharing {
-    # Idempotent: make this profile's index directory a junction to the shared
-    # store, folding in whatever it holds today. Safe to call on every launch,
-    # which is what heals a profile whose ids only appeared after its first
-    # sign-in. Returns $true once the junction is in place.
-    param($Config, $Prof, [switch]$Quiet)
-
-    $shared = Get-SharedSessionsDir -Config $Config
-    $ids = Resolve-SessionIdentity -Prof $Prof -WantAccount $AccountId -WantOrg $OrgId -Quiet:$Quiet
-    if (-not $ids) {
-        if (-not $Quiet) {
-            Write-Warn2 "Profile '$($Prof.name)' has no session index yet."
-            Write-Warn2 "Launch it, sign in once, then run '.\mcd.ps1 share $($Prof.name)'."
-        }
-        return $false
-    }
-
-    Set-ProfileProp -Prof $Prof -PropName 'accountId' -Value $ids.accountId
-    Set-ProfileProp -Prof $Prof -PropName 'orgId'     -Value $ids.orgId
-
-    if (-not (Test-Path -LiteralPath $shared)) {
-        New-Item -ItemType Directory -Path $shared -Force | Out-Null
-    }
-
-    if (Test-JunctionPath -Path $ids.path) {
-        if ((Get-JunctionTarget -Path $ids.path).TrimEnd('\') -ieq $shared.TrimEnd('\')) {
-            if (-not $Quiet) { Write-Info "Already shared: $($Prof.name) -> $shared" }
-            return $true
-        }
-        Remove-JunctionPath -Path $ids.path
-    } elseif (Test-Path -LiteralPath $ids.path) {
-        $moved = Copy-SessionIndex -From $ids.path -To $shared
-        if (@(Get-ChildItem -LiteralPath $ids.path -File -ErrorAction SilentlyContinue).Count -eq 0) {
-            Remove-Item -LiteralPath $ids.path -Recurse -Force
-            if (-not $Quiet) { Write-Info "The profile's index was empty; nothing to merge." }
-        } else {
-            $backup = "$($ids.path).mcd-bak-$(Get-Date -Format yyyyMMdd-HHmmss)"
-            Move-Item -LiteralPath $ids.path -Destination $backup
-            Remove-OldBackup -Path $ids.path
-            if (-not $Quiet) {
-                Write-Info "Merged $moved file(s) into the shared store."
-                Write-Info "Kept the profile's own index at $backup"
-            }
-        }
-    }
-
-    $parent = Split-Path -Parent $ids.path
-    if (-not (Test-Path -LiteralPath $parent)) {
-        New-Item -ItemType Directory -Path $parent -Force | Out-Null
-    }
-    New-Item -ItemType Junction -Path $ids.path -Value $shared | Out-Null
-    if (-not $Quiet) { Write-Ok "Shared '$($Prof.name)' -> $shared" }
-    return $true
-}
-
-function Remove-SessionSharing {
-    # Hand the profile back a private copy of what it could see while shared,
-    # so turning sharing off never makes sessions vanish from its list.
-    param($Config, $Prof, [switch]$Quiet)
-
-    $shared = Get-SharedSessionsDir -Config $Config
-    $ids = Resolve-SessionIdentity -Prof $Prof -WantAccount $AccountId -WantOrg $OrgId -Quiet:$Quiet
-    if (-not $ids) { return $false }
-    if (-not (Test-JunctionPath -Path $ids.path)) {
-        if (-not $Quiet) { Write-Info "Profile '$($Prof.name)' is not linked." }
-        return $false
-    }
-
-    Remove-JunctionPath -Path $ids.path
-    New-Item -ItemType Directory -Path $ids.path -Force | Out-Null
-    $n = 0
-    if (Test-Path -LiteralPath $shared) {
-        $n = Copy-SessionIndex -From $shared -To $ids.path -Overwrite
-    }
-    if (-not $Quiet) { Write-Ok "Unshared '$($Prof.name)'. Copied $n file(s) back into its own index." }
-    return $true
-}
-
 function Get-ShareState {
-    # What 'list' and the tray show: linked / pending (opted in but the index
-    # does not exist yet) / stray (linked without the flag) / '-'.
+    # What 'list' and the tray show.
     param($Config, $Prof)
     $ids = Resolve-SessionIdentity -Prof $Prof -Quiet
-    $linked = $false
-    if ($ids) { $linked = Test-JunctionPath -Path $ids.path }
-    if ($linked -and (Test-ShareEnabled -Prof $Prof)) { return 'linked' }
-    if ($linked) { return 'stray link' }
-    if (Test-ShareEnabled -Prof $Prof) { return 'pending' }
-    return '-'
+    if ($ids -and (Test-JunctionPath -Path $ids.path)) { return 'JUNCTION!' }
+    if (-not (Test-ShareEnabled -Prof $Prof)) { return '-' }
+    if (-not $ids -or -not (Test-Path -LiteralPath $ids.path)) { return 'pending' }
+    return 'synced'
 }
 
 function Assert-NotRunning {
@@ -1297,7 +1344,6 @@ function Invoke-List {
 
     Write-Info ""
     Write-Info "claude.exe : $exe"
-    Write-Info "sessions   : $(Get-SharedSessionsDir -Config $cfg)"
     Write-Info "tray       : $(if (Test-Autostart) { 'starts at sign-in' } else { 'autostart off' })"
     Write-Info ""
 
@@ -1383,11 +1429,11 @@ function Invoke-Launch {
         Write-Warn2 "Profile '$Name' already has a running instance; bringing it to the front."
     }
 
-    # Re-assert the junction before the app opens the directory. This is also
-    # what picks up the ids of a profile that had never signed in when it was
-    # opted into sharing.
+    # Pull in session list entries from the other opted-in profiles before the
+    # app reads its index. Copies files in, never touches existing ones.
     if (Test-ShareEnabled -Prof $p) {
-        if (Sync-SessionSharing -Config $cfg -Prof $p -Quiet) { Write-Config $cfg }
+        $n = New-SessionIndexSync -Config $cfg -Quiet
+        if ($n -gt 0) { Write-Info "Synced $n session list entr$(if ($n -eq 1) { 'y' } else { 'ies' })." }
     }
 
     if ($p.stock) {
@@ -1616,32 +1662,63 @@ function Select-ShareTargets {
 function Invoke-Share {
     $cfg = Read-Config
     $targets = Select-ShareTargets -Config $cfg -Usage "Usage: .\mcd.ps1 share <name> | -All"
-    $running = Get-RunningProfiles
 
     foreach ($p in $targets) {
-        if (-not $Force) { Assert-NotRunning -Prof $p -Running $running -Verb 'share' }
+        # A leftover junction from the old scheme has to go first: Claude
+        # Desktop refuses to write its index through one.
+        $ids = Resolve-SessionIdentity -Prof $p -Quiet
+        if ($ids -and (Test-JunctionPath -Path $ids.path)) {
+            throw "'$($p.name)' still has the old junction at $($ids.path). Run '.\mcd.ps1 unshare $($p.name)' with Claude Desktop closed first."
+        }
         Set-ProfileProp -Prof $p -PropName 'shareSessions' -Value $true
-        Sync-SessionSharing -Config $cfg -Prof $p | Out-Null
+        Write-Ok "Sharing sessions: $($p.name)"
     }
     Write-Config $cfg
 
+    $n = New-SessionIndexSync -Config $cfg
     Write-Info ""
-    Write-Info "Shared store: $(Get-SharedSessionsDir -Config $cfg)"
-    Write-Warn2 "Every linked profile now reads and writes the same session list,"
-    Write-Warn2 "including scheduled-tasks.json. Transcripts were already shared."
+    Write-Info "Copied $n session list entr$(if ($n -eq 1) { 'y' } else { 'ies' })."
+    Write-Info "The tray keeps them in step from here; it only ever adds entries."
+    Write-Warn2 "Do not open the SAME session in two profiles at once - they would"
+    Write-Warn2 "both append to one transcript. Different sessions are fine."
 }
 
 function Invoke-Unshare {
+    # Stops future syncing. Entries already copied in stay where they are:
+    # deleting them is the one operation that could lose something, and the
+    # profile has been showing them as its own.
     $cfg = Read-Config
     $targets = Select-ShareTargets -Config $cfg -Usage "Usage: .\mcd.ps1 unshare <name> | -All"
     $running = Get-RunningProfiles
 
     foreach ($p in $targets) {
-        if (-not $Force) { Assert-NotRunning -Prof $p -Running $running -Verb 'unshare' }
         Set-ProfileProp -Prof $p -PropName 'shareSessions' -Value $false
-        Remove-SessionSharing -Config $cfg -Prof $p | Out-Null
+
+        # Undo a junction left by the old scheme, which does need the app shut.
+        $ids = Resolve-SessionIdentity -Prof $p -Quiet
+        if ($ids -and (Test-JunctionPath -Path $ids.path)) {
+            if (-not $Force) { Assert-NotRunning -Prof $p -Running $running -Verb 'unshare' }
+            $target = Get-JunctionTarget -Path $ids.path
+            Remove-JunctionPath -Path $ids.path
+            New-Item -ItemType Directory -Path $ids.path -Force | Out-Null
+            $n = 0
+            foreach ($f in @(Get-ChildItem -LiteralPath $target -File -ErrorAction SilentlyContinue)) {
+                Copy-Item -LiteralPath $f.FullName -Destination (Join-Path $ids.path $f.Name) -Force
+                $n++
+            }
+            Write-Ok "Removed the old junction on '$($p.name)' and copied $n file(s) back."
+        } else {
+            Write-Ok "Stopped sharing: $($p.name)"
+        }
     }
     Write-Config $cfg
+}
+
+function Invoke-SyncSessions {
+    $cfg = Read-Config
+    $n = New-SessionIndexSync -Config $cfg
+    if ($n -eq 0) { Write-Info "Nothing to copy - every shared profile already has the same entries." }
+    else { Write-Ok "Copied $n session list entr$(if ($n -eq 1) { 'y' } else { 'ies' })." }
 }
 
 function Invoke-Tray {
@@ -1824,13 +1901,16 @@ Multi Claude Desktop - run several Claude accounts side by side.
   .\mcd.ps1 sync-config <from> <to>
       Copy claude_desktop_config.json (MCP servers) between profiles.
 
-  .\mcd.ps1 share <name> | -All [-AccountId <id>] [-OrgId <id>] [-Force]
-      Put this profile's Claude Code session list into the shared store, so
-      every shared profile sees and can resume the same sessions. Opt in per
-      profile - profiles you never share stay private.
+  .\mcd.ps1 share <name> | -All
+      Opt this profile into session list sharing: entries are copied between
+      shared profiles so each one lists the same sessions. Only ever copies
+      entries in - nothing is overwritten and nothing is deleted.
 
-  .\mcd.ps1 unshare <name> | -All [-Force]
-      Undo it. The profile keeps a private copy of the list it could see.
+  .\mcd.ps1 unshare <name> | -All
+      Stop syncing it. Entries already copied in stay put.
+
+  .\mcd.ps1 sync-sessions
+      Run one sync pass now. The tray does this on its own every few seconds.
 
   .\mcd.ps1 tray
       Tray icon: launch profiles and tick which ones share sessions.
@@ -1875,6 +1955,7 @@ if ($MyInvocation.InvocationName -ne '.') {
             'sync-config' { Invoke-SyncConfig }
             'share'       { Invoke-Share }
             'unshare'     { Invoke-Unshare }
+        'sync-sessions' { Invoke-SyncSessions }
             'tray'        { Invoke-Tray }
         'autostart'   { Invoke-Autostart }
         'icon'        { Invoke-Icon }

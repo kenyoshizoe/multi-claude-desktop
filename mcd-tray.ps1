@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Tray icon for Multi Claude Desktop.
 
@@ -82,37 +82,33 @@ function Start-ProfileDetached {
 }
 
 function Switch-ProfileSharing {
-    # Toggle one profile's opt-in. Refuses while the app is up: swapping the
-    # index directory under a running instance is how you lose a session list.
+    # Toggle one profile's opt-in. Copying entries in is safe at any time, so
+    # unlike the old junction scheme this does not care whether the app is up.
     param([string]$ProfileName)
 
     $cfg = Read-Config
     $p = Find-Profile -Config $cfg -ProfileName $ProfileName
     if (-not $p) { return }
 
-    if (Test-ProfileRunning -Prof $p -Running (Get-RunningProfiles)) {
-        Show-Tip -Warning -Title 'Claude is running' `
-                 -Text "Close '$($p.label)' first, then toggle session sharing."
+    $ids = Resolve-SessionIdentity -Prof $p -Quiet
+    if ($ids -and (Test-JunctionPath -Path $ids.path)) {
+        Show-Tip -Warning -Title 'Old junction in the way' `
+                 -Text "Close Claude Desktop and run 'mcd.ps1 unshare $($p.name)' once."
         return
     }
 
     if (Test-ShareEnabled -Prof $p) {
         Set-ProfileProp -Prof $p -PropName 'shareSessions' -Value $false
-        Remove-SessionSharing -Config $cfg -Prof $p -Quiet | Out-Null
         Write-Config $cfg
-        Show-Tip -Title 'Sessions unshared' `
-                 -Text "$($p.label) keeps a private copy of the list."
+        Show-Tip -Title 'Sessions no longer synced' `
+                 -Text "$($p.label) keeps the entries it already has."
     } else {
         Set-ProfileProp -Prof $p -PropName 'shareSessions' -Value $true
-        $ok = Sync-SessionSharing -Config $cfg -Prof $p -Quiet
         Write-Config $cfg
-        if ($ok) {
-            Show-Tip -Title 'Sessions shared' `
-                     -Text "$($p.label) now uses the shared session list."
-        } else {
-            Show-Tip -Warning -Title 'Not signed in yet' `
-                     -Text "$($p.label) has no session index. Launch it, sign in, then try again - the link is applied on the next launch."
-        }
+        $n = 0
+        try { $n = New-SessionIndexSync -Config $cfg -Quiet } catch { }
+        Show-Tip -Title 'Sessions synced' `
+                 -Text "$($p.label) shares its session list. Copied $n entr$(if ($n -eq 1) { 'y' } else { 'ies' })."
     }
 }
 
@@ -127,6 +123,7 @@ $script:PidToProfile = @{}      # claude.exe pid -> profile
 $script:LastPidSet   = ''
 $script:LastCfgStamp = ''
 $script:WindowState  = @{}      # hwnd -> "<aumid>|<icon>" already applied
+$script:Cfg          = $null    # last profiles.json read, reused by the sync
 
 function Get-ConfigStamp {
     if (-not (Test-Path -LiteralPath $ProfilesPath)) { return '' }
@@ -135,6 +132,7 @@ function Get-ConfigStamp {
 
 function Update-PidToProfile {
     $cfg = Read-Config
+    $script:Cfg = $cfg
     $running = Get-RunningProfiles
     $map = @{}
     foreach ($p in $cfg.profiles) {
@@ -164,6 +162,13 @@ function Invoke-WindowWatch {
         $script:LastCfgStamp = $cfgStamp
         Update-PidToProfile
     }
+
+    # Keep the shared session lists in step. A pass with nothing to do costs
+    # one directory listing per participating profile - no file is opened.
+    if ($script:Cfg) {
+        try { New-SessionIndexSync -Config $script:Cfg -Quiet | Out-Null } catch { }
+    }
+
     if ($script:PidToProfile.Count -eq 0) { return }
 
     Initialize-Native
@@ -272,10 +277,10 @@ function Build-Menu {
         $shareRoot.DropDownItems.Add($sub) | Out-Null
     }
     $shareRoot.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
-    $shareRoot.DropDownItems.Add((New-MenuItem -Text 'Open the shared session folder' -OnClick {
-        $dir = Get-SharedSessionsDir -Config (Read-Config)
-        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        Start-Process explorer.exe $dir
+    $shareRoot.DropDownItems.Add((New-MenuItem -Text 'Sync session lists now' -OnClick {
+        $n = 0
+        try { $n = New-SessionIndexSync -Config (Read-Config) -Quiet } catch { }
+        Show-Tip -Title 'Session lists' -Text "Copied $n entr$(if ($n -eq 1) { 'y' } else { 'ies' })."
     })) | Out-Null
     $Menu.Items.Add($shareRoot) | Out-Null
 
