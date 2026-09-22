@@ -1,0 +1,11 @@
+# Generated at runtime - regenerated on demand, never edited by hand.
+run-hidden.vbs
+*.bak-*
+
+# Local assets. Everything here is either generated (claude.ico, mcd-tray.ico,
+# cache/) or a picture you chose for one of your own profiles, so none of it
+# belongs to the tool itself.
+icons/
+
+# Machine-specific: absolute data directories and account ids.
+profiles.json
